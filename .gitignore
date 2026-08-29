@@ -1,0 +1,31 @@
+# Virtual environment
+venv/
+env/
+.venv/
+
+# Python cache
+__pycache__/
+*.pyc
+*.pyo
+
+# Build & packaging artifacts
+dist/
+build/
+*.egg-info/
+*.egg
+
+# Testing
+.pytest_cache/
+.coverage
+htmlcov/
+
+# Environment variables / secrets (API tokens etc.)
+.env
+.pypirc
+
+# Editor/OS junk
+.vscode/
+.idea/
+*.swp
+Thumbs.db
+.DS_Store

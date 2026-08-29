@@ -1,0 +1,40 @@
+[build-system]
+requires = ["setuptools>=68.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "defendking"
+version = "1.0.0"
+description = "A defensive-only Python security toolkit: passwords, phishing/URL checks, brute-force protection, file hygiene, web-app security, network checks, crypto helpers, and monitoring/reporting."
+readme = "README.md"
+requires-python = ">=3.9"
+license = { text = "MIT" }
+authors = [
+    { name = "Barman" }
+]
+keywords = ["security", "defensive-security", "password", "phishing", "xss", "sql-injection", "hardening"]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Intended Audience :: Developers",
+    "License :: OSI Approved :: MIT License",
+    "Programming Language :: Python :: 3",
+    "Topic :: Security",
+]
+
+# All of these are optional: the module works with zero third-party
+# dependencies for most functions. Install the extras only for the
+# specific functions that need them (HIBP/VirusTotal/Telegram calls,
+# AES-GCM encryption, JWT validation).
+[project.optional-dependencies]
+full = ["requests>=2.31", "cryptography>=42.0", "pyjwt>=2.8"]
+dev = ["pytest>=8.0"]
+
+# Package layout: a real "defendking" package folder (with __init__.py),
+# not a single top-level module. All logic lives in defendking/handler.py
+# and __init__.py re-exports it.
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["defendking*"]
+
+[project.urls]
+Repository = "https://github.com/Barman-Zarei/defendking.git"
