@@ -4,10 +4,10 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "defendking"
-version = "1.0.0"
+version = "1.5.0"
 description = "A defensive-only Python security toolkit: passwords, phishing/URL checks, brute-force protection, file hygiene, web-app security, network checks, crypto helpers, and monitoring/reporting."
 readme = "README.md"
-requires-python = ">=3.9"
+requires-python = ">=3.8"
 license = { text = "MIT" }
 authors = [
     { name = "Barman" }
@@ -37,4 +37,4 @@ where = ["."]
 include = ["defendking*"]
 
 [project.urls]
-Repository = "https://github.com/Barman-Zarei/defendking.git"
+Repository = "https://github.com/Barman/defendking"

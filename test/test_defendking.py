@@ -376,5 +376,109 @@ class TestMonitoringAndReporting(unittest.TestCase):
         self.assertEqual(checklist, ["Unknown system type"])
 
 
+class TestApiAndSessionSecurity(unittest.TestCase):
+    def test_validate_api_request_signature_valid(self):
+        secret = "shared-secret"
+        timestamp = str(time.time())
+        payload = '{"symbol":"BTCUSDT","side":"buy"}'
+        import hmac as _hmac
+        import hashlib as _hashlib
+        sig = _hmac.new(secret.encode(), f"{timestamp}{payload}".encode(), _hashlib.sha256).hexdigest()
+        result = dk.validate_api_request_signature(payload, timestamp, sig, secret)
+        self.assertTrue(result["valid"])
+
+    def test_validate_api_request_signature_bad_signature(self):
+        result = dk.validate_api_request_signature(
+            "payload", str(time.time()), "deadbeef", "secret"
+        )
+        self.assertFalse(result["valid"])
+        self.assertEqual(result["reason"], "signature mismatch")
+
+    def test_validate_api_request_signature_stale_timestamp(self):
+        old_ts = str(time.time() - 10_000)
+        result = dk.validate_api_request_signature("payload", old_ts, "whatever", "secret")
+        self.assertFalse(result["valid"])
+        self.assertIn("tolerance", result["reason"])
+
+    def test_detect_replay_attack_first_time_not_replay(self):
+        seen = set()
+        self.assertFalse(dk.detect_replay_attack("nonce-1", seen))
+        self.assertIn("nonce-1", seen)
+
+    def test_detect_replay_attack_second_time_is_replay(self):
+        seen = {"nonce-1"}
+        self.assertTrue(dk.detect_replay_attack("nonce-1", seen))
+
+    def test_check_session_fixation_rotated(self):
+        result = dk.check_session_fixation("session-a", "session-b")
+        self.assertTrue(result["rotated"])
+        self.assertFalse(result["vulnerable_to_fixation"])
+
+    def test_check_session_fixation_not_rotated(self):
+        result = dk.check_session_fixation("session-a", "session-a")
+        self.assertFalse(result["rotated"])
+        self.assertTrue(result["vulnerable_to_fixation"])
+
+    def test_generate_scoped_api_key(self):
+        result = dk.generate_scoped_api_key(["read", "trade"], prefix="sk")
+        self.assertTrue(result["api_key"].startswith("sk_"))
+        self.assertEqual(result["scopes"], ["read", "trade"])
+        expected_hash = __import__("hashlib").sha256(result["api_key"].encode()).hexdigest()
+        self.assertEqual(result["stored_hash"], expected_hash)
+
+    def test_check_api_rate_limit_headers_should_back_off(self):
+        headers = {"X-RateLimit-Limit": "100", "X-RateLimit-Remaining": "0", "X-RateLimit-Reset": "60"}
+        result = dk.check_api_rate_limit_headers(headers)
+        self.assertTrue(result["should_back_off"])
+        self.assertEqual(result["limit"], 100)
+
+    def test_check_api_rate_limit_headers_no_headers(self):
+        result = dk.check_api_rate_limit_headers({})
+        self.assertFalse(result["has_rate_limit_headers"])
+        self.assertFalse(result["should_back_off"])
+
+
+class TestStrengthenedDetection(unittest.TestCase):
+    """Sanity checks for the tightened heuristics across existing sections."""
+
+    def test_leetspeak_common_password_detected(self):
+        issues = dk.detect_common_password_patterns("P@ssw0rd")
+        self.assertTrue(any("leetspeak" in issue.lower() for issue in issues))
+
+    def test_check_suspicious_url_flags_punycode(self):
+        result = dk.check_suspicious_url("https://xn--pypal-4ve.com/login")
+        self.assertTrue(result["suspicious"])
+
+    def test_check_domain_similarity_flags_substring_spoof(self):
+        result = dk.check_domain_similarity("paypal-secure-login.com", ["paypal.com"])
+        self.assertTrue(result["likely_typosquat"])
+        self.assertTrue(result["matched_via_substring"])
+
+    def test_detect_xss_patterns_flags_meta_refresh(self):
+        found = dk.detect_xss_patterns('<meta http-equiv="refresh" content="0;url=http://evil.com">')
+        self.assertTrue(len(found) > 0)
+
+    def test_validate_input_against_sql_injection_flags_waitfor_delay(self):
+        result = dk.validate_input_against_sql_injection("'; WAITFOR DELAY '0:0:5'--")
+        self.assertTrue(result["suspicious"])
+
+    def test_detect_suspicious_file_extension_flags_hta(self):
+        result = dk.detect_suspicious_file_extension("invoice.hta")
+        self.assertTrue(result["flagged"])
+
+    def test_check_secrets_in_codebase_detects_github_token(self):
+        tmp_dir = "test_tmp_secrets_dir"
+        os.makedirs(tmp_dir, exist_ok=True)
+        try:
+            with open(os.path.join(tmp_dir, "config.py"), "w") as f:
+                f.write('GITHUB_TOKEN = "ghp_ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789"\n')
+            findings = dk.check_secrets_in_codebase(tmp_dir)
+            self.assertTrue(any("GitHub" in f["type"] for f in findings))
+        finally:
+            for name in os.listdir(tmp_dir):
+                os.remove(os.path.join(tmp_dir, name))
+            os.rmdir(tmp_dir)
+
+
 if __name__ == "__main__":
     unittest.main()

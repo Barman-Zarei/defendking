@@ -122,9 +122,15 @@ def check_password_strength(password: str) -> dict[str, Any]:
         suggestions.append("Add at least one digit.")
     if not classes["symbol"]:
         suggestions.append("Add at least one special symbol (!@#...).")
+
+    # Cross-check against the pattern detector so a password that merely
+    # "looks" diverse (e.g. "Qwerty123!") doesn't score as strong.
+    pattern_issues = detect_common_password_patterns(password)
+    score -= min(len(pattern_issues) * 15, score)  # never go below 0 here
+    suggestions.extend(pattern_issues)
+
     if password.lower() in _COMMON_PASSWORDS:
         score = min(score, 10)
-        suggestions.append("This password is one of the most commonly leaked passwords.")
 
     label = "weak" if score < 40 else "medium" if score < 70 else "strong"
     return {"score": score, "label": label, "suggestions": suggestions}
@@ -219,21 +225,36 @@ def verify_password(password: str, stored_hash: str) -> bool:
     return hmac.compare_digest(candidate, expected)  # timing-safe comparison
 
 
+_LEET_SUBSTITUTIONS = str.maketrans({"0": "o", "1": "l", "3": "e", "4": "a", "5": "s", "7": "t", "@": "a", "$": "s"})
+
+
 def detect_common_password_patterns(password: str) -> list[str]:
-    """Flag common weak patterns: keyboard walks, repeats, sequences, dates."""
+    """
+    Flag common weak patterns: keyboard walks, repeats, sequences, dates,
+    leetspeak substitutions of common words, and short repeated blocks.
+    """
     issues = []
     lowered = password.lower()
+    de_leeted = lowered.translate(_LEET_SUBSTITUTIONS)
 
     if lowered in _COMMON_PASSWORDS:
         issues.append("Appears in the common-password list")
+    elif de_leeted in _COMMON_PASSWORDS:
+        issues.append("Is a common password with characters substituted (leetspeak), e.g. p@ssw0rd")
     if re.search(r"(.)\1{2,}", password):
         issues.append("Contains a repeated character run (e.g. aaa)")
+    if re.search(r"(.{2,4})\1{1,}", lowered):
+        issues.append("Contains a repeated multi-character block (e.g. abcabc)")
     if re.search(r"(0123|1234|2345|3456|4567|5678|6789|9876|8765|7654|6543|5432|4321|3210)", password):
         issues.append("Contains a simple numeric sequence")
-    if re.search(r"(qwerty|asdf|zxcv|qazwsx)", lowered):
+    if re.search(r"(abcd|bcde|cdef|defg|efgh|wxyz|zyxw|dcba)", lowered):
+        issues.append("Contains a simple alphabetic sequence")
+    if re.search(r"(qwerty|qwertz|azerty|asdf|asdfg|zxcv|qazwsx|1qaz|2wsx|poiuy|lkjh)", lowered):
         issues.append("Contains a keyboard-walk pattern")
     if re.search(r"(19|20)\d{2}", password):
         issues.append("Likely contains a birth year or date")
+    if re.search(r"(0[1-9]|1[0-2])[/\-.](0[1-9]|[12]\d|3[01])", password):
+        issues.append("Likely contains a date (MM/DD or similar)")
 
     return issues
 
@@ -305,8 +326,13 @@ def check_default_credentials(username: str, password: str) -> bool:
     """
     known_defaults = {
         ("admin", "admin"), ("admin", "password"), ("admin", "12345"),
-        ("root", "root"), ("root", "toor"), ("administrator", "administrator"),
-        ("user", "user"), ("guest", "guest"),
+        ("admin", "1234"), ("admin", "1234567"), ("admin", "pass"),
+        ("root", "root"), ("root", "toor"), ("root", "admin"),
+        ("administrator", "administrator"), ("administrator", "password"),
+        ("user", "user"), ("guest", "guest"), ("guest", ""),
+        ("pi", "raspberry"), ("ubnt", "ubnt"), ("cisco", "cisco"),
+        ("service", "service"), ("support", "support"),
+        ("admin", ""), ("", "admin"), ("default", "default"),
     }
     return (username.lower(), password.lower()) in known_defaults
 
@@ -315,8 +341,19 @@ def check_default_credentials(username: str, password: str) -> bool:
 # SECTION 2 - PHISHING & URL / EMAIL SAFETY
 # ==========================================================================
 
-_URL_SHORTENERS = {"bit.ly", "tinyurl.com", "t.co", "goo.gl", "ow.ly", "is.gd"}
-_SUSPICIOUS_TLDS = {"zip", "mov", "xyz", "top", "gq", "tk", "ml"}
+_URL_SHORTENERS = {
+    "bit.ly", "tinyurl.com", "t.co", "goo.gl", "ow.ly", "is.gd", "buff.ly",
+    "rebrand.ly", "cutt.ly", "shorte.st", "tiny.cc", "rb.gy", "s.id", "lnkd.in",
+}
+_SUSPICIOUS_TLDS = {
+    "zip", "mov", "xyz", "top", "gq", "tk", "ml", "cf", "ga", "work", "click",
+    "link", "support", "men", "review", "loan", "download", "stream", "info",
+    "biz", "icu", "cam", "monster",
+}
+_HIGH_VALUE_BRANDS = {
+    "paypal", "google", "microsoft", "apple", "amazon", "netflix", "facebook",
+    "instagram", "bankofamerica", "wellsfargo", "chase", "irs", "dhl", "fedex",
+}
 
 
 def check_suspicious_url(url: str) -> dict[str, Any]:
@@ -330,29 +367,61 @@ def check_suspicious_url(url: str) -> dict[str, Any]:
     """
     reasons = []
     lowered = url.lower()
+    netloc = lowered.split("//")[-1].split("/")[0]
 
     if re.match(r"^https?://\d{1,3}(\.\d{1,3}){3}", lowered):
         reasons.append("Uses a raw IP address instead of a domain name")
+    if re.search(r"://0x[0-9a-f]+", lowered) or re.search(r"://\d{8,10}(?:[:/]|$)", lowered):
+        reasons.append("Uses a hex/decimal-encoded IP address (obfuscation technique)")
     if "@" in url.split("//")[-1]:
         reasons.append("Contains an '@' character in the URL (used to hide the real destination)")
     if any(short in lowered for short in _URL_SHORTENERS):
         reasons.append("Uses a link-shortening service")
     if not lowered.startswith("https://"):
         reasons.append("Connection is not encrypted (HTTPS)")
-    tld = lowered.rstrip("/").rsplit(".", 1)[-1].split("/")[0]
+    if "xn--" in netloc:
+        reasons.append("Uses punycode (xn--) - can hide look-alike/homograph domains")
+    tld = lowered.rstrip("/").rsplit(".", 1)[-1].split("/")[0].split("?")[0]
     if tld in _SUSPICIOUS_TLDS:
         reasons.append(f"Suspicious top-level domain (.{tld})")
     if lowered.count("-") > 4:
         reasons.append("Unusually many hyphens in the domain (common in spoofed domains)")
+    if netloc.count(".") >= 4:
+        reasons.append("Unusually deep subdomain nesting (can hide the real domain)")
+    if re.search(r":\d{2,5}(?:/|$)", netloc) and not re.search(r":(?:80|443)(?:/|$)", netloc):
+        reasons.append("Uses a non-standard port number")
+    brand_in_text = [b for b in _HIGH_VALUE_BRANDS if b in netloc]
+    if brand_in_text and not any(netloc == b + tld_suffix for b in brand_in_text for tld_suffix in (".com", ".org", ".net")):
+        if "-" in netloc or netloc.count(".") >= 2:
+            reasons.append(f"Mentions a well-known brand ({brand_in_text[0]}) in a domain that isn't its official one")
 
     return {"url": url, "suspicious": len(reasons) > 0, "reasons": reasons}
+
+
+# Common visual look-alike substitutions used in homograph/typosquat domains
+# (e.g. "paypa1.com" or "rnicrosoft.com"). Normalizing these before computing
+# edit distance catches lookalikes that a raw character-diff would miss.
+_HOMOGLYPH_NORMALIZATION = [
+    ("rn", "m"), ("vv", "w"), ("1", "l"), ("0", "o"), ("5", "s"), ("3", "e"),
+    ("!", "i"), ("|", "l"),
+]
+
+
+def _normalize_homoglyphs(text: str) -> str:
+    normalized = text
+    for pattern, replacement in _HOMOGLYPH_NORMALIZATION:
+        normalized = normalized.replace(pattern, replacement)
+    return normalized
 
 
 def check_domain_similarity(domain: str, trusted_domains: Iterable[str]) -> dict[str, Any]:
     """
     Detect typosquatting by computing Levenshtein distance between `domain`
-    and each trusted domain. A small distance (1-2) with a different domain
-    is a strong phishing signal.
+    and each trusted domain, both as written and after normalizing common
+    homoglyph substitutions (rn->m, 1->l, 0->o, ...). A small distance (1-2)
+    with a different domain is a strong phishing signal. Also flags the
+    trusted brand name appearing as a *substring* inside a longer domain
+    (e.g. "paypal-secure-verify.com"), which plain edit distance misses.
     """
     def levenshtein(a: str, b: str) -> int:
         if len(a) < len(b):
@@ -365,14 +434,42 @@ def check_domain_similarity(domain: str, trusted_domains: Iterable[str]) -> dict
             prev = curr
         return prev[-1]
 
-    closest, best_dist = None, float("inf")
+    domain_lower = domain.lower()
+    domain_normalized = _normalize_homoglyphs(domain_lower)
+
+    closest, best_dist, matched_as_homoglyph = None, float("inf"), False
+    substring_match = None
     for trusted in trusted_domains:
-        dist = levenshtein(domain.lower(), trusted.lower())
+        trusted_lower = trusted.lower()
+        trusted_root = trusted_lower.split(".")[0]
+
+        raw_dist = levenshtein(domain_lower, trusted_lower)
+        homoglyph_dist = levenshtein(domain_normalized, _normalize_homoglyphs(trusted_lower))
+        dist = min(raw_dist, homoglyph_dist)
         if dist < best_dist:
             closest, best_dist = trusted, dist
+            matched_as_homoglyph = homoglyph_dist < raw_dist
 
-    is_typosquat = closest is not None and 0 < best_dist <= 2 and domain.lower() != closest.lower()
-    return {"domain": domain, "closest_trusted": closest, "distance": best_dist, "likely_typosquat": is_typosquat}
+        if (
+            substring_match is None
+            and domain_lower != trusted_lower
+            and len(trusted_root) >= 4
+            and trusted_root in domain_lower
+        ):
+            substring_match = trusted
+
+    is_typosquat = (
+        (closest is not None and best_dist <= 2 and domain_lower != closest.lower())
+        or substring_match is not None
+    )
+    return {
+        "domain": domain,
+        "closest_trusted": substring_match or closest,
+        "distance": best_dist,
+        "likely_typosquat": is_typosquat,
+        "matched_via_homoglyph_normalization": matched_as_homoglyph,
+        "matched_via_substring": substring_match is not None,
+    }
 
 
 def check_ssl_certificate(hostname: str, port: int = 443, timeout: float = 5.0) -> dict[str, Any]:
@@ -406,21 +503,53 @@ def scan_email_for_phishing_signs(email_text: str) -> dict[str, Any]:
     reasons = []
     lowered = email_text.lower()
 
-    urgency_terms = ["urgent", "act now", "immediately", "within 24 hours", "right now"]
+    urgency_terms = [
+        "urgent", "act now", "immediately", "within 24 hours", "right now",
+        "final notice", "account suspended", "account will be closed",
+        "your account has been limited", "expires today", "last chance",
+        "unusual activity", "verify immediately", "action required",
+    ]
     if any(term in lowered for term in urgency_terms):
         reasons.append("Uses urgency/pressure language")
 
-    credential_terms = ["enter your password", "verify your account", "confirm your password", "click here"]
+    credential_terms = [
+        "enter your password", "verify your account", "confirm your password",
+        "click here", "update your billing", "confirm your identity",
+        "reactivate your account", "unlock your account", "provide your ssn",
+        "confirm your card", "re-enter your login", "security check required",
+    ]
     if any(term in lowered for term in credential_terms):
         reasons.append("Asks the reader to enter sensitive credentials")
+
+    if re.search(r"\b(wire transfer|gift card|bitcoin|crypto(?:currency)?|western union)\b.{0,40}\b(send|pay|purchase|transfer)\b", lowered) or \
+       re.search(r"\b(send|pay|purchase|transfer)\b.{0,40}\b(wire transfer|gift card|bitcoin|crypto(?:currency)?|western union)\b", lowered):
+        reasons.append("Requests an unusual/hard-to-trace payment method (gift cards, wire transfer, crypto)")
+
+    attachment_terms = [".exe", ".scr", ".zip", ".js", ".vbs", ".jar", ".hta", ".iso"]
+    if re.search(r"(open|download|see|review)\s+the\s+attach", lowered) and any(ext in lowered for ext in attachment_terms):
+        reasons.append("Encourages opening an attachment with a potentially dangerous extension")
 
     urls = re.findall(r"https?://\S+", email_text)
     suspicious_urls = [u for u in urls if check_suspicious_url(u)["suspicious"]]
     if suspicious_urls:
         reasons.append(f"{len(suspicious_urls)} suspicious link(s) found in the email")
 
-    if re.search(r"dear (customer|user|sir/madam)", lowered):
+    # Brand mentioned in the body but none of the links actually point to
+    # that brand's real domain - a classic spoofing pattern.
+    mentioned_brands = [b for b in _HIGH_VALUE_BRANDS if b in lowered]
+    if mentioned_brands and urls:
+        official_domain_seen = any(
+            re.search(rf"://(?:www\.)?{re.escape(b)}\.(?:com|org|net)(?:/|$)", u.lower())
+            for b in mentioned_brands for u in urls
+        )
+        if not official_domain_seen:
+            reasons.append(f"Mentions {mentioned_brands[0]} but no link actually points to its real domain")
+
+    if re.search(r"dear (customer|user|sir/madam|valued member|account holder)", lowered):
         reasons.append("Generic greeting instead of a real name (common in mass phishing)")
+
+    if re.search(r"[!]{2,}|[$]{2,}", email_text):
+        reasons.append("Excessive punctuation/formatting often used for emphasis in scam emails")
 
     return {"suspicious": len(reasons) > 0, "reasons": reasons, "suspicious_urls": suspicious_urls}
 
@@ -641,7 +770,9 @@ def detect_privilege_escalation_attempt(role_before: str, role_after: str, allow
 
 _DANGEROUS_EXTENSIONS = {
     ".exe", ".scr", ".bat", ".cmd", ".com", ".pif", ".vbs", ".js",
-    ".jar", ".ps1", ".msi", ".dll",
+    ".jar", ".ps1", ".msi", ".dll", ".hta", ".wsf", ".wsh", ".lnk",
+    ".msc", ".reg", ".vbe", ".jse", ".ws", ".msp", ".scf", ".cpl",
+    ".gadget", ".apk", ".app", ".jsp", ".sh", ".bin", ".iso", ".ps1xml",
 }
 
 
@@ -683,13 +814,21 @@ def detect_suspicious_file_extension(filename: str) -> dict[str, Any]:
     lowered = filename.lower()
     ext = os.path.splitext(lowered)[1]
     is_dangerous = ext in _DANGEROUS_EXTENSIONS
-    double_ext = bool(re.search(r"\.(pdf|doc|jpg|png|txt)\.(exe|scr|bat|js|vbs)$", lowered))
+    double_ext = bool(re.search(
+        r"\.(pdf|doc|docx|xls|xlsx|jpg|jpeg|png|gif|txt|csv|zip|rar)\."
+        r"(exe|scr|bat|cmd|js|jse|vbs|vbe|wsf|hta|ps1|lnk|com|pif|msi)$",
+        lowered,
+    ))
+    # Right-to-left override character (U+202E) is used to visually flip a
+    # filename so a hidden dangerous extension appears to be something safe.
+    rtlo_trick = "\u202e" in filename
     return {
         "filename": filename,
         "extension": ext,
         "dangerous_extension": is_dangerous,
         "double_extension_trick": double_ext,
-        "flagged": is_dangerous or double_ext,
+        "rtl_override_trick": rtlo_trick,
+        "flagged": is_dangerous or double_ext or rtlo_trick,
     }
 
 
@@ -785,14 +924,29 @@ def detect_xss_patterns(input_text: str) -> list[str]:
     """
     patterns = {
         r"<script.*?>": "<script> tag",
-        r"on\w+\s*=": "inline event handler (onerror, onclick, ...)",
+        r"on\w+\s*=": "inline event handler (onerror, onclick, onload, ...)",
         r"javascript:": "javascript: protocol",
+        r"vbscript:": "vbscript: protocol",
+        r"data:text/html": "data: URI with HTML payload",
         r"<iframe": "<iframe> tag",
         r"<img[^>]+onerror": "<img> tag with onerror handler",
         r"<svg[^>]*onload": "<svg> tag with onload handler",
+        r"<body[^>]*onload": "<body> tag with onload handler",
+        r"<details[^>]*ontoggle": "<details> tag with ontoggle handler (auto-fires without a click)",
+        r"<marquee[^>]*onstart": "<marquee> tag with onstart handler",
         r"document\.cookie": "access to document.cookie",
+        r"document\.location": "redirect via document.location",
+        r"window\.location\s*=": "redirect via window.location",
         r"<object[^>]*data\s*=": "<object> tag with data attribute",
+        r"<embed[^>]+src\s*=": "<embed> tag with src attribute",
         r"expression\s*\(": "CSS expression() (legacy IE XSS vector)",
+        r"formaction\s*=": "formaction attribute (can hijack form submission)",
+        r"srcdoc\s*=": "srcdoc attribute on an iframe-like element",
+        r"<meta[^>]+http-equiv\s*=\s*[\"']?refresh": "meta refresh redirect",
+        r"&#x[0-9a-f]+;|&#\d+;": "HTML entity-encoded characters (can hide a payload from simple filters)",
+        r"\\u00[0-9a-f]{2}": "unicode-escaped characters (can hide a payload from simple filters)",
+        r"eval\s*\(": "use of eval()",
+        r"settimeout\s*\(\s*[\"']": "setTimeout() called with a string argument (implicit eval)",
     }
     found = [label for pattern, label in patterns.items() if re.search(pattern, input_text, re.IGNORECASE)]
     return found
@@ -822,13 +976,32 @@ def validate_input_against_sql_injection(user_input: str) -> dict[str, Any]:
         r"((\%3D)|(=))[^\n]*((\%27)|(\')|(\-\-)|(\%3B)|(;))",
         r"\w*((\%27)|(\'))((\%6F)|o|(\%4F))((\%72)|r|(\%52))",
         r"union[^\n]*select",
+        r"union\s+all\s+select",
         r"select[^\n]*from",
         r"drop\s+table",
+        r"drop\s+database",
         r"insert\s+into",
+        r"update\s+\w+\s+set",
+        r"delete\s+from",
         r"exec(\s|\()",
+        r"exec(?:ute)?\s+xp_cmdshell",
         r"information_schema",
         r"sleep\s*\(\s*\d+\s*\)",
+        r"waitfor\s+delay",
+        r"benchmark\s*\(",
         r";\s*--",
+        r"'\s*or\s*'?\d+'?\s*=\s*'?\d+",       # ' or '1'='1 / ' or 1=1
+        r"'\s*or\s*''\s*=\s*''",              # ' or ''=''
+        r"\bor\s+1\s*=\s*1\b",
+        r"having\s+1\s*=\s*1",
+        r"group_concat\s*\(",
+        r"load_file\s*\(",
+        r"into\s+outfile",
+        r"into\s+dumpfile",
+        r"0x[0-9a-f]{6,}",                     # long hex literal (common in blind SQLi)
+        r"/\*.*?\*/",                          # inline SQL comment used to break up keywords
+        r"cast\s*\([^)]*as\s+\w+\)",
+        r"convert\s*\([^)]*,\s*\w+\)",
     ]
     matched = [p for p in patterns if re.search(p, user_input, re.IGNORECASE)]
     return {"suspicious": len(matched) > 0, "matched_patterns": len(matched)}
@@ -846,20 +1019,48 @@ def check_security_headers(headers: dict[str, str]) -> dict[str, Any]:
         "x-content-type-options": lowered.get("x-content-type-options") == "nosniff",
         "strict-transport-security": lowered.get("strict-transport-security") is not None,
         "referrer-policy": lowered.get("referrer-policy") is not None,
+        "permissions-policy": lowered.get("permissions-policy") is not None,
+        "cross-origin-opener-policy": lowered.get("cross-origin-opener-policy") is not None,
+        "cross-origin-resource-policy": lowered.get("cross-origin-resource-policy") is not None,
     }
     missing = [k for k, present in checklist.items() if not present]
-    return {"checklist": checklist, "missing": missing, "score": round(100 * (len(checklist) - len(missing)) / len(checklist))}
+
+    weak = []
+    hsts = lowered.get("strict-transport-security")
+    if hsts and "max-age=0" in hsts.replace(" ", "").lower():
+        weak.append("strict-transport-security has max-age=0 (effectively disabled)")
+    xfo = lowered.get("x-frame-options", "")
+    if xfo and xfo.upper() not in ("DENY", "SAMEORIGIN"):
+        weak.append(f"x-frame-options has a non-standard value: {xfo}")
+
+    return {
+        "checklist": checklist,
+        "missing": missing,
+        "weak_configurations": weak,
+        "score": round(100 * (len(checklist) - len(missing)) / len(checklist)),
+    }
 
 
 def verify_csp_header(csp_header: str) -> dict[str, Any]:
     """Flag overly permissive Content-Security-Policy directives."""
     issues = []
-    if "unsafe-inline" in csp_header:
+    lowered = csp_header.lower()
+
+    if "unsafe-inline" in lowered:
         issues.append("'unsafe-inline' allows inline scripts (XSS risk)")
-    if "unsafe-eval" in csp_header:
+    if "unsafe-eval" in lowered:
         issues.append("'unsafe-eval' allows the use of eval()")
-    if re.search(r"default-src\s+\*", csp_header):
-        issues.append("default-src * allows almost any source")
+    if "data:" in lowered and re.search(r"script-src[^;]*data:", lowered):
+        issues.append("script-src allows 'data:' URIs, which can smuggle inline scripts")
+    if re.search(r"(default|script)-src\s+\*(?!\S)", lowered):
+        issues.append("default-src/script-src * allows almost any source")
+    if "object-src" not in lowered and "default-src" not in lowered:
+        issues.append("No object-src or default-src fallback - Flash/plugin-based vectors aren't restricted")
+    if "frame-ancestors" not in lowered:
+        issues.append("No frame-ancestors directive - clickjacking isn't mitigated by this policy alone")
+    if "base-uri" not in lowered:
+        issues.append("No base-uri directive - a <base> tag injection could redirect relative URLs")
+
     return {"issues": issues, "safe": len(issues) == 0}
 
 
@@ -886,12 +1087,16 @@ def check_firewall_rules_status(rules: list[dict[str, Any]]) -> dict[str, Any]:
     `iptables -L` or a cloud security-group export) for overly permissive
     entries such as 0.0.0.0/0 on sensitive ports.
     """
-    sensitive_ports = {22, 23, 3389, 3306, 5432, 6379, 27017}
+    sensitive_ports = {
+        21, 22, 23, 25, 135, 139, 445, 1433, 1521, 2049, 3306, 3389,
+        5432, 5900, 6379, 8080, 8443, 9200, 11211, 27017, 27018, 27019,
+    }
+    open_sources = {"0.0.0.0/0", "any", "*", "::/0"}
     risky = []
     for rule in rules:
         source = rule.get("source", "")
         port = rule.get("port")
-        if source in ("0.0.0.0/0", "any", "*") and port in sensitive_ports:
+        if source in open_sources and port in sensitive_ports:
             risky.append(rule)
     return {"total_rules": len(rules), "risky_rules": risky, "risky_count": len(risky)}
 
@@ -1033,10 +1238,22 @@ def validate_jwt_token(token: str, secret: str, algorithms: Optional[list[str]] 
 
 
 _SECRET_LIKE_PATTERNS = [
-    (r"AKIA[0-9A-Z]{16}", "Possible AWS Access Key"),
+    (r"AKIA[0-9A-Z]{16}", "Possible AWS Access Key ID"),
+    (r"(?i)aws_secret_access_key[\"']?\s*[:=]\s*[\"'][A-Za-z0-9/+=]{40}[\"']", "Possible AWS Secret Access Key"),
     (r"(?i)api[_-]?key[\"']?\s*[:=]\s*[\"'][A-Za-z0-9_\-]{16,}[\"']", "Hardcoded API key"),
     (r"(?i)secret[\"']?\s*[:=]\s*[\"'][A-Za-z0-9_\-]{16,}[\"']", "Hardcoded secret"),
-    (r"-----BEGIN (RSA|EC|OPENSSH) PRIVATE KEY-----", "Private key embedded in code"),
+    (r"(?i)(auth[_-]?token|access[_-]?token)[\"']?\s*[:=]\s*[\"'][A-Za-z0-9_\-\.]{16,}[\"']", "Hardcoded auth/access token"),
+    (r"-----BEGIN (RSA|EC|OPENSSH|DSA|PGP) PRIVATE KEY-----", "Private key embedded in code"),
+    (r"gh[pousr]_[A-Za-z0-9]{36}", "Possible GitHub personal access / OAuth token"),
+    (r"xox[baprs]-[A-Za-z0-9-]{10,}", "Possible Slack token"),
+    (r"AIza[0-9A-Za-z_\-]{35}", "Possible Google API key"),
+    (r"sk_live_[0-9a-zA-Z]{24,}", "Possible Stripe live secret key"),
+    (r"pk_live_[0-9a-zA-Z]{24,}", "Possible Stripe live publishable key"),
+    (r"SG\.[A-Za-z0-9_\-]{22}\.[A-Za-z0-9_\-]{43}", "Possible SendGrid API key"),
+    (r"AC[a-f0-9]{32}", "Possible Twilio Account SID"),
+    (r"key-[a-f0-9]{32}", "Possible Mailgun API key"),
+    (r"eyJ[A-Za-z0-9_\-]+\.eyJ[A-Za-z0-9_\-]+\.[A-Za-z0-9_\-]+", "Hardcoded JWT token"),
+    (r"(?i)(db|database)[_-]?(password|pwd)[\"']?\s*[:=]\s*[\"'][^\"'\s]{6,}[\"']", "Hardcoded database password"),
 ]
 
 
@@ -1235,6 +1452,124 @@ def generate_security_checklist(system_type: str) -> list[str]:
         ],
     }
     return checklists.get(system_type, ["Unknown system type"])
+
+
+# ==========================================================================
+# SECTION 9 - API & SESSION SECURITY
+# ==========================================================================
+
+def validate_api_request_signature(
+    payload: str,
+    timestamp: str,
+    signature: str,
+    secret: str,
+    tolerance_seconds: int = 300,
+) -> dict[str, Any]:
+    """
+    Verify an HMAC-SHA256 request signature - the common "sign the payload +
+    timestamp with a shared secret" pattern used by many REST/exchange/
+    trading APIs. Also rejects requests whose timestamp is too far in the
+    past or future, which shrinks the replay window even before
+    `detect_replay_attack` is involved.
+
+    The expected signature is computed as:
+        HMAC_SHA256(secret, f"{timestamp}{payload}")
+    (match this construction on the signing side too).
+    """
+    try:
+        request_time = float(timestamp)
+    except (TypeError, ValueError):
+        return {"valid": False, "reason": "timestamp is not a valid number"}
+
+    now = time.time()
+    if abs(now - request_time) > tolerance_seconds:
+        return {"valid": False, "reason": "timestamp is outside the allowed tolerance window"}
+
+    expected_sig = hmac.new(
+        secret.encode("utf-8"), f"{timestamp}{payload}".encode("utf-8"), hashlib.sha256
+    ).hexdigest()
+    valid = hmac.compare_digest(expected_sig, signature)
+    return {"valid": valid, "reason": None if valid else "signature mismatch"}
+
+
+def detect_replay_attack(nonce: str, seen_nonces: set, max_stored: int = 100_000) -> bool:
+    """
+    Track previously-seen request nonces (a fresh unique id sent with every
+    request) to catch replayed requests. Mutates `seen_nonces` in place -
+    for a real multi-process service, back this with a TTL-based store
+    (e.g. Redis SETEX) instead of an in-memory set.
+
+    Returns True if `nonce` is a replay (the caller should reject the
+    request), False if it's new (and it's recorded for next time).
+    """
+    if nonce in seen_nonces:
+        return True
+    seen_nonces.add(nonce)
+    if len(seen_nonces) > max_stored:
+        # Bound memory growth; this evicts an arbitrary entry, so in
+        # production prefer a real TTL-based store instead.
+        seen_nonces.pop()
+    return False
+
+
+def check_session_fixation(pre_login_session_id: str, post_login_session_id: str) -> dict[str, Any]:
+    """
+    Verify that the session ID was rotated after a successful login. If the
+    ID is unchanged, the application is vulnerable to session fixation: an
+    attacker who plants a known session ID on a victim before login can
+    reuse that same ID to hijack the session after the victim authenticates.
+    """
+    rotated = pre_login_session_id != post_login_session_id
+    return {"rotated": rotated, "vulnerable_to_fixation": not rotated}
+
+
+def generate_scoped_api_key(scopes: list[str], prefix: str = "sk") -> dict[str, Any]:
+    """
+    Generate a new API key that carries an associated scope list, e.g.
+    "sk_<random>". Returns both the full token (hand this to the caller
+    exactly once) and a SHA-256 hash of it (store only this server-side -
+    never store the raw key, so a database leak doesn't leak usable keys).
+    """
+    random_part = secrets.token_urlsafe(32)
+    full_key = f"{prefix}_{random_part}"
+    key_hash = hashlib.sha256(full_key.encode("utf-8")).hexdigest()
+    return {
+        "api_key": full_key,
+        "stored_hash": key_hash,
+        "scopes": list(scopes),
+        "created_at": datetime.now(timezone.utc).isoformat(),
+    }
+
+
+def check_api_rate_limit_headers(headers: dict[str, str]) -> dict[str, Any]:
+    """
+    Parse standard-ish rate-limit response headers (X-RateLimit-Limit /
+    -Remaining / -Reset, or the IETF-draft RateLimit-* form) from a response
+    your own client received, so it can back off before hitting a 429 -
+    handy for anything polling an exchange/trading API on a schedule.
+    """
+    lowered = {k.lower(): v for k, v in headers.items()}
+
+    def _get_int(*keys: str) -> Optional[int]:
+        for key in keys:
+            if key in lowered:
+                try:
+                    return int(lowered[key])
+                except ValueError:
+                    continue
+        return None
+
+    limit = _get_int("x-ratelimit-limit", "ratelimit-limit")
+    remaining = _get_int("x-ratelimit-remaining", "ratelimit-remaining")
+    reset = _get_int("x-ratelimit-reset", "ratelimit-reset")
+
+    return {
+        "limit": limit,
+        "remaining": remaining,
+        "reset": reset,
+        "should_back_off": remaining is not None and remaining <= 0,
+        "has_rate_limit_headers": limit is not None or remaining is not None,
+    }
 
 
 # ==========================================================================

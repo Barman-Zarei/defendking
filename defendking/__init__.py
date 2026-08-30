@@ -99,6 +99,13 @@ from .handler import (
     schedule_periodic_scan,
     generate_security_checklist,
 
+    # Section 9 - API & session security
+    validate_api_request_signature,
+    detect_replay_attack,
+    check_session_fixation,
+    generate_scoped_api_key,
+    check_api_rate_limit_headers,
+
     # module logger, in case a consumer wants to attach their own handler
     logger,
 )
@@ -128,8 +135,10 @@ __all__ = [
     "export_findings_to_json", "generate_incident_response_report", "audit_user_permissions",
     "notify_admin_dashboard", "send_security_alert", "schedule_periodic_scan",
     "generate_security_checklist",
+    "validate_api_request_signature", "detect_replay_attack", "check_session_fixation",
+    "generate_scoped_api_key", "check_api_rate_limit_headers",
     "logger",
 ]
 
-__version__ = "1.0.0"
+__version__ = "1.5.0"
 __author__ = "Barman"
