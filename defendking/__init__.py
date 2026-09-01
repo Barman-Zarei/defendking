@@ -16,6 +16,7 @@ Author: Barman
 License: MIT
 """
 
+from .exceptions import DefendKingError, InvalidInputError, ExternalServiceError
 from .handler import (
     # Section 1 - Passwords & authentication
     check_password_strength,
@@ -138,7 +139,8 @@ __all__ = [
     "validate_api_request_signature", "detect_replay_attack", "check_session_fixation",
     "generate_scoped_api_key", "check_api_rate_limit_headers",
     "logger",
+    "DefendKingError", "InvalidInputError", "ExternalServiceError",
 ]
 
-__version__ = "1.5.0"
+__version__ = "2.5.1"
 __author__ = "Barman"

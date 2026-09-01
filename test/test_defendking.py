@@ -32,7 +32,7 @@ class TestPasswordFunctions(unittest.TestCase):
         self.assertEqual(result["label"], "strong")
 
     def test_check_password_strength_rejects_non_string(self):
-        with self.assertRaises(TypeError):
+        with self.assertRaises(dk.InvalidInputError):
             dk.check_password_strength(12345678)
 
     def test_check_password_strength_flags_common_password(self):
@@ -442,7 +442,7 @@ class TestStrengthenedDetection(unittest.TestCase):
     """Sanity checks for the tightened heuristics across existing sections."""
 
     def test_leetspeak_common_password_detected(self):
-        issues = dk.detect_common_password_patterns("P@ssw0rd")
+        issues = dk.detect_common_password_patterns("L3tM3in")
         self.assertTrue(any("leetspeak" in issue.lower() for issue in issues))
 
     def test_check_suspicious_url_flags_punycode(self):
@@ -478,6 +478,116 @@ class TestStrengthenedDetection(unittest.TestCase):
             for name in os.listdir(tmp_dir):
                 os.remove(os.path.join(tmp_dir, name))
             os.rmdir(tmp_dir)
+
+
+class TestExceptionHierarchy(unittest.TestCase):
+    """2.5.1: verify the InvalidInputError / ExternalServiceError convention."""
+
+    def test_invalid_input_error_is_a_value_error(self):
+        self.assertTrue(issubclass(dk.InvalidInputError, ValueError))
+        self.assertTrue(issubclass(dk.InvalidInputError, dk.DefendKingError))
+
+    def test_external_service_error_is_a_defendking_error(self):
+        self.assertTrue(issubclass(dk.ExternalServiceError, dk.DefendKingError))
+
+    def test_programmer_error_raises_invalid_input_error(self):
+        with self.assertRaises(dk.InvalidInputError):
+            dk.generate_strong_password(length=2)
+        with self.assertRaises(dk.InvalidInputError):
+            dk.check_domain_similarity(123, ["example.com"])
+        with self.assertRaises(dk.InvalidInputError):
+            dk.RateLimiter(max_attempts=-1)
+        with self.assertRaises(dk.InvalidInputError):
+            IPB = dk.IPBlocklist()
+            IPB.block("not-an-ip")
+
+    def test_external_failure_returns_error_dict_not_raise(self):
+        # check_ssl_certificate against an unreachable/invalid host should
+        # report the failure inline rather than raise.
+        result = dk.check_ssl_certificate("this-host-should-not-exist.invalid", timeout=1)
+        self.assertFalse(result["valid"])
+        self.assertEqual(result.get("error_type"), "ExternalServiceError")
+
+    def test_compute_file_hash_raises_external_service_error_for_missing_file(self):
+        with self.assertRaises(dk.ExternalServiceError):
+            dk.compute_file_hash("this/path/does/not/exist.txt")
+
+    def test_log_failed_login_attempt_returns_dict(self):
+        path = "test_tmp_login_log.csv"
+        try:
+            result = dk.log_failed_login_attempt("baduser", "1.2.3.4", log_path=path)
+            self.assertTrue(result["success"])
+            self.assertTrue(os.path.exists(path))
+        finally:
+            if os.path.exists(path):
+                os.remove(path)
+
+    def test_export_findings_to_json_returns_dict(self):
+        findings = [dk.SecurityFinding(category="test", description="x", severity="low")]
+        path = "test_tmp_findings.json"
+        try:
+            result = dk.export_findings_to_json(findings, path)
+            self.assertTrue(result["success"])
+            self.assertTrue(os.path.exists(path))
+        finally:
+            if os.path.exists(path):
+                os.remove(path)
+
+    def test_security_finding_rejects_invalid_severity(self):
+        with self.assertRaises(dk.InvalidInputError):
+            dk.SecurityFinding(category="x", description="y", severity="apocalyptic")
+
+
+class TestFurtherStrengthenedDetection(unittest.TestCase):
+    """2.5.1: spot-check the deepened detection logic across sections."""
+
+    def test_check_password_strength_has_entropy_field(self):
+        result = dk.check_password_strength("correct horse battery staple 42!")
+        self.assertIn("entropy_bits", result)
+        self.assertGreater(result["entropy_bits"], 0)
+
+    def test_check_suspicious_url_has_risk_score(self):
+        result = dk.check_suspicious_url("http://192.168.1.1@fake-paypal-login.tk/verify")
+        self.assertIn("risk_score", result)
+        self.assertGreater(result["risk_score"], 0)
+
+    def test_scan_email_for_phishing_signs_has_risk_score(self):
+        email = "Dear customer, act now and click here to verify your account: http://bit.ly/xyz"
+        result = dk.scan_email_for_phishing_signs(email)
+        self.assertIn("risk_score", result)
+        self.assertGreater(result["risk_score"], 0)
+
+    def test_validate_input_against_sql_injection_has_severity(self):
+        result = dk.validate_input_against_sql_injection("' UNION ALL SELECT username, password FROM users--")
+        self.assertIn("severity", result)
+        self.assertIn(result["severity"], ("low", "medium", "high"))
+
+    def test_detect_anomalous_login_location_high_confidence(self):
+        t1 = datetime.now(timezone.utc)
+        t2 = t1 + timedelta(minutes=1)
+        tehran = (35.6892, 51.3890)
+        new_york = (40.7128, -74.0060)
+        result = dk.detect_anomalous_login_location("IR", "US", t1, t2, previous_coords=tehran, new_coords=new_york)
+        self.assertTrue(result["anomalous"])
+        self.assertTrue(result["high_confidence"])
+
+    def test_check_domain_similarity_tld_swap(self):
+        result = dk.check_domain_similarity("paypal.net", ["paypal.com"])
+        self.assertTrue(result["likely_typosquat"])
+        self.assertTrue(result["matched_via_tld_swap"])
+
+    def test_check_secure_cookie_flags_samesite_none_without_secure(self):
+        result = dk.check_secure_cookie_flags("session=abc; SameSite=None")
+        self.assertTrue(result["samesite_none_without_secure"])
+
+    def test_calculate_risk_score_by_severity_breakdown(self):
+        findings = [
+            dk.SecurityFinding(category="a", description="x", severity="critical"),
+            dk.SecurityFinding(category="b", description="y", severity="low"),
+        ]
+        result = dk.calculate_risk_score(findings)
+        self.assertTrue(result["has_critical_finding"])
+        self.assertEqual(result["by_severity"]["critical"], 1)
 
 
 if __name__ == "__main__":
