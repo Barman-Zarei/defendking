@@ -49,3 +49,4 @@ class ExternalServiceError(DefendKingError):
     type to standardize around instead of leaking raw `requests`/`socket`
     exception types.
     """
+    

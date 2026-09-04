@@ -2549,3 +2549,4 @@ if __name__ == "__main__":
     print(generate_strong_password())
     print(check_suspicious_url("http://192.168.1.1@paypal-login.tk/verify"))
     print(generate_security_checklist("web"))
+    
