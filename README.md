@@ -10,7 +10,7 @@ or access systems you don't own/manage.
 
 **Author:** Barman
 **License:** MIT
-**Current version:** 3.6.16
+**Current version:** 3.6.17
 
 ---
 
@@ -45,7 +45,7 @@ pip install "defendking[dev]"         # adds pytest for running the test suite
 For local development (editable install from a clone):
 ```bash
 pip install -e ".[full,dev]"
-python -m pytest tests/ -v
+python -m pytest test/ -v
 ruff check .
 mypy defendking/
 ```
@@ -576,6 +576,22 @@ dk.check_api_rate_limit_headers({"X-RateLimit-Remaining": "0", "Retry-After": "3
   real deployments.
 
 ## Changelog
+
+### 3.6.17
+- **Fixed the CI pipeline itself** (the previous release's workflow had
+  two bugs, caught only after the first real run on GitHub):
+  - The test job ran `pytest tests/` but the actual test directory is
+    named `test/` (no "s") - every test job failed immediately with a
+    "no tests collected" error regardless of the code being tested.
+    Fixed by aligning the workflow, `pyproject.toml`'s mypy config, and
+    the README's documented commands to the real `test/` directory name.
+  - `requires-python` was set to `>=3.9`, which made the `Test (Python
+    3.8)` matrix job fail at the `pip install` step before any test
+    could even run, since this project intentionally supports 3.8.
+    Reverted to `>=3.8` (verified via AST inspection that the codebase
+    uses no 3.9+-only syntax - no walrus operator, no `match` statements).
+- No functional changes to `defendking/handler.py` in this release - this
+  is a CI/tooling-only fix.
 
 ### 3.6.16
 - **Fixed every weakness identified in a self-review of 2.5.1:**

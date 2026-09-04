@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "defendking"
-version = "3.6.16"
+version = "3.6.17"
 description = "A defensive-only Python security toolkit: passwords, phishing/URL checks, brute-force protection, file hygiene, web-app security, network checks, crypto helpers, and monitoring/reporting."
 readme = "README.md"
 requires-python = ">=3.8"
@@ -67,5 +67,4 @@ ignore_missing_imports = true
 disallow_untyped_defs = false
 warn_return_any = false
 warn_unused_ignores = true
-exclude = ["tests/", "build/"]
-
+exclude = ["test/", "build/"]

@@ -1,8 +1,8 @@
 """
 Unit tests for DefendKing.
 
-Run with:  python -m pytest tests/ -v
-or:        python -m unittest discover -s tests
+Run with:  python -m pytest test/ -v
+or:        python -m unittest discover -s test
 
 These tests avoid real network calls (breach API, VirusTotal, Telegram,
 etc.) by either testing pure-logic functions directly or by passing

@@ -134,5 +134,5 @@ __all__ = [
     "DefendKingError", "InvalidInputError", "ExternalServiceError",
 ]
 
-__version__ = "3.6.16"
+__version__ = "3.6.17"
 __author__ = "Barman"
