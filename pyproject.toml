@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "defendking"
-version = "2.5.1"
+version = "3.6.16"
 description = "A defensive-only Python security toolkit: passwords, phishing/URL checks, brute-force protection, file hygiene, web-app security, network checks, crypto helpers, and monitoring/reporting."
 readme = "README.md"
 requires-python = ">=3.8"
@@ -27,7 +27,7 @@ classifiers = [
 # AES-GCM encryption, JWT validation).
 [project.optional-dependencies]
 full = ["requests>=2.31", "cryptography>=42.0", "pyjwt>=2.8"]
-dev = ["pytest>=8.0"]
+dev = ["pytest>=8.0", "ruff>=0.6", "mypy>=1.11"]
 
 # Package layout: a real "defendking" package folder (with __init__.py),
 # not a single top-level module. All logic lives in defendking/handler.py
@@ -38,3 +38,34 @@ include = ["defendking*"]
 
 [project.urls]
 Repository = "https://github.com/Barman-Zarei/defendking"
+
+# --------------------------------------------------------------------
+# Linting (ruff) - used by the CI "lint" job.
+# --------------------------------------------------------------------
+[tool.ruff]
+line-length = 120
+target-version = "py39"
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "B", "I", "UP"]
+# E501 (line too long) is left to the formatter/line-length setting above.
+# UP007/UP045 push Optional[X] -> X | None; both are valid Python 3.9+
+# syntax (thanks to `from __future__ import annotations`), so this is a
+# style preference, not a correctness issue - the codebase consistently
+# uses Optional[] and rewriting every occurrence isn't worth the churn.
+ignore = ["E501", "UP007", "UP045"]
+
+# --------------------------------------------------------------------
+# Type-checking (mypy) - used by the CI "lint" job.
+# Kept permissive on purpose: the codebase favors dict-shaped returns
+# (documented in each docstring) over strict static typing, so this
+# catches genuine type errors without demanding a full typing rewrite.
+# --------------------------------------------------------------------
+[tool.mypy]
+python_version = "3.10"
+ignore_missing_imports = true
+disallow_untyped_defs = false
+warn_return_any = false
+warn_unused_ignores = true
+exclude = ["tests/", "build/"]
+

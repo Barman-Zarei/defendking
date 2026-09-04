@@ -73,14 +73,16 @@ import secrets
 import socket
 import ssl
 import string
+import threading
 import time
 import unicodedata
 from collections import defaultdict, deque
+from collections.abc import Iterable
 from dataclasses import dataclass, field
-from datetime import datetime, timedelta, timezone
-from typing import Any, Iterable, Optional
+from datetime import datetime, timezone
+from typing import Any, Optional
 
-from .exceptions import DefendKingError, ExternalServiceError, InvalidInputError
+from .exceptions import ExternalServiceError, InvalidInputError
 
 # --------------------------------------------------------------------------
 # Module-level logger. Consumers of the package can configure handlers;
@@ -102,6 +104,73 @@ def _require_nonempty_str(value: Any, name: str) -> None:
     _require_type(value, str, name)
     if not value.strip():
         raise InvalidInputError(f"{name} must not be empty")
+
+
+# Functions that run a battery of regex patterns against caller-supplied
+# text (XSS/SQLi/URL/email/password scanning) cap the input length before
+# scanning. This isn't about "how long is realistic" - it's a ReDoS
+# mitigation: several of the patterns below use bounded-but-nested
+# quantifiers (e.g. repeated-group detection), and worst-case backtracking
+# cost grows with input length. Capping input size bounds the worst case
+# regardless of which specific pattern a future edit might introduce.
+_MAX_SCANNED_TEXT_LENGTH = 20_000
+# Email bodies/free text blocks are legitimately much longer than a URL or
+# password, so they get a separate, higher cap rather than sharing the
+# tighter limit above.
+_MAX_LONG_TEXT_LENGTH = 200_000
+
+
+def _require_scannable_text(value: Any, name: str, max_length: int = _MAX_SCANNED_TEXT_LENGTH) -> None:
+    """Internal helper: validate a string that's about to be run through
+    multiple regexes (ReDoS mitigation - see _MAX_SCANNED_TEXT_LENGTH)."""
+    _require_type(value, str, name)
+    if len(value) > max_length:
+        raise InvalidInputError(
+            f"{name} is {len(value)} characters, which exceeds the {max_length}-character "
+            f"limit for regex-based scanning functions (this limit exists to bound worst-case regex cost - "
+            f"split large input into chunks if you need to scan more)"
+        )
+
+
+def _luhn_checksum_valid(digits: str) -> bool:
+    """
+    Internal helper: validate a digit string against the Luhn algorithm
+    (used by real card numbers). Used to avoid flagging arbitrary
+    13-19-digit numbers (phone numbers, IDs, timestamps) as credit card
+    numbers - only numbers that actually pass the checksum are redacted
+    as a "card number", which cuts down on false positives substantially.
+    """
+    total = 0
+    reverse_digits = digits[::-1]
+    for i, ch in enumerate(reverse_digits):
+        d = int(ch)
+        if i % 2 == 1:
+            d *= 2
+            if d > 9:
+                d -= 9
+        total += d
+    return total % 10 == 0
+
+
+def _with_retry(func, retries: int = 2, backoff_seconds: float = 0.5):
+    """
+    Internal helper: call `func()` and retry on transient network errors
+    (timeouts, connection resets, temporary DNS failures) with a short
+    linear backoff between attempts. Used by the network-facing functions
+    in sections 2/6 so a single dropped packet doesn't get reported as a
+    hard failure - the underlying exception is re-raised unchanged after
+    the final attempt so callers see the real error, not a wrapper.
+    """
+    last_exc: Exception | None = None
+    for attempt in range(retries + 1):
+        try:
+            return func()
+        except (TimeoutError, ConnectionError, socket.gaierror, socket.timeout, OSError) as exc:
+            last_exc = exc
+            if attempt < retries:
+                time.sleep(backoff_seconds * (attempt + 1))
+    assert last_exc is not None
+    raise last_exc
 
 
 # ==========================================================================
@@ -152,12 +221,26 @@ def check_password_strength(password: str) -> dict[str, Any]:
     class diversity, estimated entropy, and known weak-pattern detection
     (NOT a substitute for a breach check - see `check_password_breached`).
 
+    Note on `entropy_bits`: this is a charset-size-based estimate
+    (log2(charset_size) * length), which assumes characters are drawn
+    uniformly at random from whatever classes are present. A real
+    dictionary-and-pattern-aware estimator (e.g. zxcvbn) will score
+    something like "Password1!" far lower than this formula alone would,
+    because it recognizes "Password" as a dictionary word - this function
+    covers part of that gap via `detect_common_password_patterns` (whose
+    findings reduce `score` directly), but the `entropy_bits` number
+    itself does not account for dictionary words on its own. Treat
+    `entropy_bits` as a rough signal, and `score`/`label` (which combine
+    it with pattern detection) as the more reliable overall verdict.
+
     Raises `InvalidInputError` if `password` isn't a string.
     Returns a dict with `score`, `label`, `entropy_bits`, and `suggestions`.
     """
     _require_type(password, str, "password")
     if password == "":
         return {"score": 0, "label": "weak", "entropy_bits": 0.0, "suggestions": ["Password is empty."]}
+    if len(password) > _MAX_SCANNED_TEXT_LENGTH:
+        raise InvalidInputError(f"password is unreasonably long ({len(password)} chars) for a strength check")
 
     length = len(password)
     classes = {
@@ -333,7 +416,7 @@ def detect_common_password_patterns(password: str) -> list[str]:
     leetspeak substitutions of common words, and short repeated blocks.
     Raises `InvalidInputError` if `password` isn't a string.
     """
-    _require_type(password, str, "password")
+    _require_scannable_text(password, "password")
     issues = []
     lowered = password.lower()
     de_leeted = lowered.translate(_LEET_SUBSTITUTIONS)
@@ -540,6 +623,7 @@ def check_suspicious_url(url: str) -> dict[str, Any]:
     callers can rank multiple URLs by severity instead of only a yes/no.
     """
     _require_nonempty_str(url, "url")
+    _require_scannable_text(url, "url")
     # weight, reason-builder pairs accumulate into a 0-100 risk score
     weighted_reasons: list[tuple[int, str]] = []
     lowered = url.lower()
@@ -681,19 +765,31 @@ def check_ssl_certificate(hostname: str, port: int = 443, timeout: float = 5.0) 
     _require_nonempty_str(hostname, "hostname")
     context = ssl.create_default_context()
     try:
-        with socket.create_connection((hostname, port), timeout=timeout) as sock:
-            with context.wrap_socket(sock, server_hostname=hostname) as ssock:
-                cert = ssock.getpeercert()
+        def _connect_and_get_cert():
+            with socket.create_connection((hostname, port), timeout=timeout) as sock:
+                with context.wrap_socket(sock, server_hostname=hostname) as ssock:
+                    return ssock.getpeercert()
+
+        # Transient network hiccups (a dropped packet, a momentary DNS
+        # blip) shouldn't be reported as "certificate invalid" - retry a
+        # couple of times before giving up.
+        cert = _with_retry(_connect_and_get_cert)
+        if not cert:
+            raise ExternalServiceError(f"no certificate returned by {hostname}:{port}")
         # `datetime.utcnow()` is deprecated (and naive); build an
-        # explicit timezone-aware UTC datetime instead.
-        not_after = datetime.strptime(cert["notAfter"], "%b %d %H:%M:%S %Y %Z").replace(tzinfo=timezone.utc)
+        # explicit timezone-aware UTC datetime instead. `ssl`'s cert dict
+        # is loosely typed (str | tuple[...] per field), so cast the two
+        # date fields to str explicitly before parsing.
+        not_after = datetime.strptime(str(cert["notAfter"]), "%b %d %H:%M:%S %Y %Z").replace(tzinfo=timezone.utc)
         days_left = (not_after - datetime.now(timezone.utc)).days
-        not_before = datetime.strptime(cert["notBefore"], "%b %d %H:%M:%S %Y %Z").replace(tzinfo=timezone.utc)
+        not_before = datetime.strptime(str(cert["notBefore"]), "%b %d %H:%M:%S %Y %Z").replace(tzinfo=timezone.utc)
+        issuer_fields: tuple = cert.get("issuer", ())
+        subject_fields: tuple = cert.get("subject", ())
         return {
             "hostname": hostname,
             "valid": True,
-            "issuer": dict(x[0] for x in cert.get("issuer", [])),
-            "subject": dict(x[0] for x in cert.get("subject", [])),
+            "issuer": dict(x[0] for x in issuer_fields),
+            "subject": dict(x[0] for x in subject_fields),
             "issued": not_before.isoformat(),
             "expires": not_after.isoformat(),
             "days_until_expiry": days_left,
@@ -715,6 +811,7 @@ def scan_email_for_phishing_signs(email_text: str) -> dict[str, Any]:
     yes/no.
     """
     _require_type(email_text, str, "email_text")
+    _require_scannable_text(email_text, "email_text", max_length=_MAX_LONG_TEXT_LENGTH)
     weighted_reasons: list[tuple[int, str]] = []
     lowered = email_text.lower()
 
@@ -792,6 +889,7 @@ def extract_and_check_links(text: str) -> list[dict[str, Any]]:
     on each. Raises `InvalidInputError` if `text` isn't a string.
     """
     _require_type(text, str, "text")
+    _require_scannable_text(text, "text", max_length=_MAX_LONG_TEXT_LENGTH)
     urls = re.findall(r"https?://\S+", text)
     return [check_suspicious_url(u) for u in urls]
 
@@ -840,7 +938,11 @@ def validate_email_format_and_mx(email: str, check_mx: bool = True) -> dict[str,
 class RateLimiter:
     """
     Simple in-memory sliding-window rate limiter, e.g. for login endpoints.
-    For multi-process/production deployments back this with Redis instead.
+    Thread-safe: a single internal lock guards all state, so one
+    RateLimiter instance can safely be shared across threads (e.g. worker
+    threads in a WSGI server). For multi-*process*/production deployments,
+    back this with Redis instead - an in-process lock doesn't help across
+    process boundaries.
     Raises `InvalidInputError` on construction if `max_attempts` or
     `window_seconds` aren't positive.
     """
@@ -855,27 +957,31 @@ class RateLimiter:
         self.max_attempts = max_attempts
         self.window_seconds = window_seconds
         self._attempts: dict[str, deque] = defaultdict(deque)
+        self._lock = threading.Lock()
 
     def allow(self, key: str) -> bool:
         """Return True if `key` (e.g. IP or username) is still within limits."""
         _require_nonempty_str(key, "key")
         now = time.time()
-        window = self._attempts[key]
-        while window and now - window[0] > self.window_seconds:
-            window.popleft()
-        if len(window) >= self.max_attempts:
-            return False
-        window.append(now)
-        return True
+        with self._lock:
+            window = self._attempts[key]
+            while window and now - window[0] > self.window_seconds:
+                window.popleft()
+            if len(window) >= self.max_attempts:
+                return False
+            window.append(now)
+            return True
 
     def remaining(self, key: str) -> int:
         _require_nonempty_str(key, "key")
-        return max(self.max_attempts - len(self._attempts[key]), 0)
+        with self._lock:
+            return max(self.max_attempts - len(self._attempts[key]), 0)
 
     def reset(self, key: str) -> None:
         """Clear all tracked attempts for `key` (e.g. after a successful login)."""
         _require_nonempty_str(key, "key")
-        self._attempts.pop(key, None)
+        with self._lock:
+            self._attempts.pop(key, None)
 
 
 def rate_limiter(key: str, store: dict[str, deque], max_attempts: int = 5, window_seconds: int = 300) -> bool:
@@ -898,7 +1004,7 @@ def rate_limiter(key: str, store: dict[str, deque], max_attempts: int = 5, windo
     return True
 
 
-def detect_brute_force_attempt(failed_timestamps: list[float], threshold: int = 5, window_seconds: int = 60) -> bool:
+def detect_brute_force_attempt(failed_timestamps: list[float], threshold: int = 5, window_seconds: float = 60) -> bool:
     """
     Given a list of failed-login unix timestamps, detect a brute-force
     burst (threshold-many failures within window_seconds of each other).
@@ -920,10 +1026,15 @@ def detect_brute_force_attempt(failed_timestamps: list[float], threshold: int = 
 
 
 class IPBlocklist:
-    """In-memory temporary IP blocklist with automatic expiry."""
+    """
+    In-memory temporary IP blocklist with automatic expiry. Thread-safe:
+    a single internal lock guards all state, so one instance can safely
+    be shared across threads.
+    """
 
     def __init__(self):
         self._blocked: dict[str, float] = {}
+        self._lock = threading.Lock()
 
     def block(self, ip: str, duration_seconds: int = 900) -> None:
         """
@@ -937,21 +1048,24 @@ class IPBlocklist:
             raise InvalidInputError(f"'{ip}' is not a valid IP address") from exc
         if duration_seconds <= 0:
             raise InvalidInputError("duration_seconds must be positive")
-        self._blocked[ip] = time.time() + duration_seconds
+        with self._lock:
+            self._blocked[ip] = time.time() + duration_seconds
         logger.info("IP blocked: %s for %s seconds", ip, duration_seconds)
 
     def is_blocked(self, ip: str) -> bool:
-        expiry = self._blocked.get(ip)
-        if expiry is None:
-            return False
-        if time.time() > expiry:
-            del self._blocked[ip]
-            return False
-        return True
+        with self._lock:
+            expiry = self._blocked.get(ip)
+            if expiry is None:
+                return False
+            if time.time() > expiry:
+                del self._blocked[ip]
+                return False
+            return True
 
     def unblock(self, ip: str) -> bool:
         """Manually lift a block early. Returns True if the IP was blocked."""
-        return self._blocked.pop(ip, None) is not None
+        with self._lock:
+            return self._blocked.pop(ip, None) is not None
 
 
 def block_ip_temporarily(ip: str, blocklist: IPBlocklist, duration_seconds: int = 900) -> None:
@@ -1218,6 +1332,19 @@ def scan_directory_for_malware_signatures(directory: str, signatures: dict[str, 
     """
     Walk a directory you own/manage and flag files whose SHA-256 hash matches
     a provided dict of {hash: label} known-malware signatures.
+
+    Important limitation: exact-hash matching is inherently brittle -
+    changing a single byte of a malicious file (repacking, a different
+    compiler flag, appended junk data) produces a completely different
+    hash and silently evades this check entirely. This is a property of
+    hash-based detection in general, not a bug fixable within this
+    function; exact-hash matching is still useful for catching *known,
+    unmodified* malware samples (e.g. from a threat-intel feed), but it
+    is not a substitute for real AV/EDR, which use fuzzy hashing (e.g.
+    ssdeep/TLSH) and behavioral analysis to catch variants. If you need
+    that, pair this function with a real scanning engine rather than
+    relying on it alone.
+
     Raises `InvalidInputError` if `directory` doesn't exist or `signatures`
     isn't a dict. Per-file read errors (permissions, broken symlinks) are
     silently skipped, since one unreadable file shouldn't abort scanning
@@ -1344,6 +1471,7 @@ def detect_xss_patterns(input_text: str) -> list[str]:
     (`verify_csp_header`).
     """
     _require_type(input_text, str, "input_text")
+    _require_scannable_text(input_text, "input_text")
     patterns = {
         r"<script.*?>": "<script> tag",
         r"on\w+\s*=": "inline event handler (onerror, onclick, onload, ...)",
@@ -1385,7 +1513,7 @@ def detect_xss_patterns(input_text: str) -> list[str]:
     return found
 
 
-def check_secure_cookie_flags(set_cookie_header: str) -> dict[str, bool]:
+def check_secure_cookie_flags(set_cookie_header: str) -> dict[str, Any]:
     """
     Parse a Set-Cookie header string and check for the key security flags.
     Raises `InvalidInputError` if `set_cookie_header` isn't a string.
@@ -1417,6 +1545,7 @@ def validate_input_against_sql_injection(user_input: str) -> dict[str, Any]:
     in addition to the plain `suspicious` boolean.
     """
     _require_type(user_input, str, "user_input")
+    _require_scannable_text(user_input, "user_input")
     patterns = [
         r"(\%27)|(\')|(\-\-)|(\%23)|(#)",
         r"((\%3D)|(=))[^\n]*((\%27)|(\')|(\-\-)|(\%3B)|(;))",
@@ -1555,17 +1684,20 @@ def check_tls_version_support(hostname: str, port: int = 443, timeout: float = 5
     _require_nonempty_str(hostname, "hostname")
     context = ssl.create_default_context()
     try:
-        with socket.create_connection((hostname, port), timeout=timeout) as sock:
-            with context.wrap_socket(sock, server_hostname=hostname) as ssock:
-                version = ssock.version()
-                cipher = ssock.cipher()
+        def _connect_and_get_info():
+            with socket.create_connection((hostname, port), timeout=timeout) as sock:
+                with context.wrap_socket(sock, server_hostname=hostname) as ssock:
+                    return ssock.version(), ssock.cipher()
+
+        version, cipher = _with_retry(_connect_and_get_info)
         outdated = version in {"TLSv1", "TLSv1.1", "SSLv3", "SSLv2"}
-        weak_cipher = bool(cipher) and any(term in cipher[0] for term in ("RC4", "DES", "MD5", "NULL", "EXPORT"))
+        cipher_name = cipher[0] if cipher else None
+        weak_cipher = cipher_name is not None and any(term in cipher_name for term in ("RC4", "DES", "MD5", "NULL", "EXPORT"))
         return {
             "hostname": hostname,
             "tls_version": version,
             "outdated": outdated,
-            "cipher_suite": cipher[0] if cipher else None,
+            "cipher_suite": cipher_name,
             "weak_cipher": weak_cipher,
         }
     except Exception as exc:
@@ -1595,13 +1727,13 @@ def check_firewall_rules_status(rules: list[dict[str, Any]]) -> dict[str, Any]:
         port_range = rule.get("port_range")  # optional: (start, end) tuple
         is_open_source = source in open_sources
         hits_sensitive_port = port in sensitive_ports
-        hits_wide_range = bool(port_range) and (port_range[1] - port_range[0]) >= 100
+        hits_wide_range = port_range is not None and (port_range[1] - port_range[0]) >= 100
         if is_open_source and (hits_sensitive_port or hits_wide_range):
             risky.append(rule)
     return {"total_rules": len(rules), "risky_rules": risky, "risky_count": len(risky)}
 
 
-def detect_arp_spoofing(arp_table: dict[str, str], known_good_mappings: dict[str, str]) -> list[dict[str, str]]:
+def detect_arp_spoofing(arp_table: dict[str, str], known_good_mappings: dict[str, str]) -> list[dict[str, Any]]:
     """
     Compare a current IP->MAC ARP table snapshot against a known-good mapping
     (e.g. your gateway's real MAC) to flag possible ARP spoofing on your LAN.
@@ -1611,7 +1743,7 @@ def detect_arp_spoofing(arp_table: dict[str, str], known_good_mappings: dict[str
     """
     _require_type(arp_table, dict, "arp_table")
     _require_type(known_good_mappings, dict, "known_good_mappings")
-    conflicts = []
+    conflicts: list[dict[str, Any]] = []
     for ip, mac in arp_table.items():
         expected_mac = known_good_mappings.get(ip)
         if expected_mac and mac.lower() != expected_mac.lower():
@@ -1744,9 +1876,14 @@ def mask_sensitive_data_in_logs(log_line: str, fields_to_mask: Iterable[str] = (
     Redact values of known-sensitive fields (key=value or key: value
     style) in a log line. Raises `InvalidInputError` if `log_line` isn't
     a string. Also redacts common bare-pattern secrets even without a
-    "field=" prefix: bearer tokens and 16-digit-looking card numbers.
+    "field=" prefix: bearer tokens, and 13-19-digit runs that pass the
+    Luhn checksum (i.e. are plausibly real card numbers, not just any
+    long number - a plain digit-count regex would also flag phone
+    numbers, order IDs, and timestamps, which is a lot of noisy
+    over-redaction for something that isn't actually a card number).
     """
     _require_type(log_line, str, "log_line")
+    _require_scannable_text(log_line, "log_line", max_length=_MAX_LONG_TEXT_LENGTH)
     masked = log_line
     for field_name in fields_to_mask:
         masked = re.sub(
@@ -1756,7 +1893,14 @@ def mask_sensitive_data_in_logs(log_line: str, fields_to_mask: Iterable[str] = (
             flags=re.IGNORECASE,
         )
     masked = re.sub(r"(?i)(bearer\s+)[A-Za-z0-9_\-\.]{16,}", r"\1***REDACTED***", masked)
-    masked = re.sub(r"\b(?:\d[ -]?){13,19}\b", "***REDACTED-CARD***", masked)
+
+    def _redact_if_luhn_valid(match: re.Match) -> str:
+        digits_only = re.sub(r"[ -]", "", match.group(0))
+        if 13 <= len(digits_only) <= 19 and _luhn_checksum_valid(digits_only):
+            return "***REDACTED-CARD***"
+        return match.group(0)
+
+    masked = re.sub(r"\b(?:\d[ -]?){13,19}\b", _redact_if_luhn_valid, masked)
     return masked
 
 
@@ -1797,8 +1941,8 @@ def decrypt_sensitive_data(token: str, key: bytes) -> str:
     if len(key) != 32:
         raise InvalidInputError(f"key must be exactly 32 bytes for AES-256-GCM, got {len(key)}")
 
-    from cryptography.hazmat.primitives.ciphers.aead import AESGCM
     from cryptography.exceptions import InvalidTag
+    from cryptography.hazmat.primitives.ciphers.aead import AESGCM
 
     try:
         raw = base64.b64decode(token, validate=True)
@@ -1890,8 +2034,8 @@ def check_secrets_in_codebase(directory: str, file_extensions: tuple[str, ...] =
                 continue
             path = os.path.join(root, name)
             try:
-                with open(path, "r", encoding="utf-8", errors="ignore") as f:
-                    content = f.read()
+                with open(path, encoding="utf-8", errors="ignore") as f:
+                    content = f.read(_MAX_LONG_TEXT_LENGTH * 5)  # cap per-file read; see _MAX_LONG_TEXT_LENGTH
             except (OSError, PermissionError):
                 continue
             for pattern, label in _SECRET_LIKE_PATTERNS:
@@ -2040,7 +2184,7 @@ def audit_user_permissions(users: list[dict[str, Any]], expected_max_role: dict[
     role_rank = {"viewer": 0, "editor": 1, "admin": 2, "superadmin": 3}
     over_privileged = []
     for user in users:
-        dept = user.get("department")
+        dept = user.get("department") or ""
         max_allowed = expected_max_role.get(dept, "viewer")
         if role_rank.get(user.get("role", "viewer"), 0) > role_rank.get(max_allowed, 0):
             over_privileged.append(user)
@@ -2219,7 +2363,7 @@ def validate_api_request_signature(
         return {"valid": False, "reason": "timestamp is outside the allowed tolerance window"}
 
     expected_sig = hmac.new(
-        secret.encode("utf-8"), f"{timestamp}{payload}".encode("utf-8"), hashlib.sha256
+        secret.encode("utf-8"), f"{timestamp}{payload}".encode(), hashlib.sha256
     ).hexdigest()
     if len(expected_sig) != len(signature):
         return {"valid": False, "reason": "signature mismatch"}
@@ -2230,9 +2374,17 @@ def validate_api_request_signature(
 def detect_replay_attack(nonce: str, seen_nonces: set, max_stored: int = 100_000) -> bool:
     """
     Track previously-seen request nonces (a fresh unique id sent with every
-    request) to catch replayed requests. Mutates `seen_nonces` in place -
-    for a real multi-process service, back this with a TTL-based store
-    (e.g. Redis SETEX) instead of an in-memory set.
+    request) to catch replayed requests. Mutates `seen_nonces` in place.
+
+    This plain-set version is intentionally simple, but has two real
+    limitations worth knowing about: it's not thread-safe (concurrent
+    callers can race on the same set), and entries never expire by time,
+    only by count (`max_stored`, evicted arbitrarily). If either of those
+    matters for your use case, use `ReplayGuard` instead - it adds a lock
+    and real per-nonce TTL expiry while keeping the same in-memory
+    approach. For a multi-*process* service, back it with a real
+    TTL-based store (e.g. Redis SETEX) regardless, since neither of these
+    in-process options helps across process boundaries.
 
     Returns True if `nonce` is a replay (the caller should reject the
     request), False if it's new (and it's recorded for next time).
@@ -2249,6 +2401,50 @@ def detect_replay_attack(nonce: str, seen_nonces: set, max_stored: int = 100_000
         # production prefer a real TTL-based store instead.
         seen_nonces.pop()
     return False
+
+
+class ReplayGuard:
+    """
+    Thread-safe, TTL-based nonce tracker for replay-attack detection - the
+    stateful, production-friendlier sibling of `detect_replay_attack`.
+    A single internal lock guards all state, and each nonce is
+    automatically forgotten after `ttl_seconds` (rather than only being
+    evicted once a size cap is hit), so memory doesn't grow unbounded and
+    old nonces can't collide with a legitimately reused ID scheme long
+    after the fact.
+
+    For a multi-*process* deployment, back this with Redis (`SET nonce 1
+    EX ttl_seconds NX`) instead - an in-process lock/dict doesn't
+    coordinate across separate processes or machines.
+    """
+
+    def __init__(self, ttl_seconds: float = 300):
+        _require_type(ttl_seconds, (int, float), "ttl_seconds")
+        if ttl_seconds <= 0:
+            raise InvalidInputError("ttl_seconds must be positive")
+        self.ttl_seconds = ttl_seconds
+        self._seen: dict[str, float] = {}
+        self._lock = threading.Lock()
+
+    def _evict_expired(self, now: float) -> None:
+        expired = [n for n, expiry in self._seen.items() if expiry <= now]
+        for n in expired:
+            del self._seen[n]
+
+    def check(self, nonce: str) -> bool:
+        """Returns True if `nonce` is a replay (reject the request), False if it's new."""
+        _require_nonempty_str(nonce, "nonce")
+        now = time.time()
+        with self._lock:
+            self._evict_expired(now)
+            if nonce in self._seen:
+                return True
+            self._seen[nonce] = now + self.ttl_seconds
+            return False
+
+    def __len__(self) -> int:
+        with self._lock:
+            return len(self._seen)
 
 
 def check_session_fixation(pre_login_session_id: str, post_login_session_id: str) -> dict[str, Any]:

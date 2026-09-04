@@ -11,10 +11,10 @@ use_api=False / mocking the `requests` calls where relevant.
 
 import os
 import sys
+import threading
 import time
 import unittest
 from datetime import datetime, timedelta, timezone
-from unittest.mock import MagicMock, patch
 
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
 
@@ -381,8 +381,8 @@ class TestApiAndSessionSecurity(unittest.TestCase):
         secret = "shared-secret"
         timestamp = str(time.time())
         payload = '{"symbol":"BTCUSDT","side":"buy"}'
-        import hmac as _hmac
         import hashlib as _hashlib
+        import hmac as _hmac
         sig = _hmac.new(secret.encode(), f"{timestamp}{payload}".encode(), _hashlib.sha256).hexdigest()
         result = dk.validate_api_request_signature(payload, timestamp, sig, secret)
         self.assertTrue(result["valid"])
@@ -588,6 +588,115 @@ class TestFurtherStrengthenedDetection(unittest.TestCase):
         result = dk.calculate_risk_score(findings)
         self.assertTrue(result["has_critical_finding"])
         self.assertEqual(result["by_severity"]["critical"], 1)
+
+
+class TestWeaknessFixes(unittest.TestCase):
+    """3.6.16: verify the specific weaknesses called out in the code review are fixed."""
+
+    def test_redos_guard_rejects_oversized_password(self):
+        huge = "a" * 25_000
+        with self.assertRaises(dk.InvalidInputError):
+            dk.check_password_strength(huge)
+
+    def test_redos_guard_rejects_oversized_url(self):
+        huge_url = "https://example.com/" + ("a" * 25_000)
+        with self.assertRaises(dk.InvalidInputError):
+            dk.check_suspicious_url(huge_url)
+
+    def test_redos_guard_allows_normal_sized_input(self):
+        # Sanity check the guard doesn't get in the way of real usage.
+        result = dk.detect_xss_patterns("<script>alert(1)</script>" * 10)
+        self.assertTrue(len(result) > 0)
+
+    def test_mask_sensitive_data_no_false_positive_on_phone_number(self):
+        # A phone-number-shaped 13-19 digit run that does NOT pass Luhn
+        # should NOT be redacted as a card number.
+        line = "called customer at 1234567890123 regarding order"
+        masked = dk.mask_sensitive_data_in_logs(line)
+        self.assertIn("1234567890123", masked)
+        self.assertNotIn("REDACTED-CARD", masked)
+
+    def test_mask_sensitive_data_redacts_valid_luhn_card_number(self):
+        # 4111111111111111 is the standard Luhn-valid Visa test number.
+        line = "charged card 4111111111111111 for order #5521"
+        masked = dk.mask_sensitive_data_in_logs(line)
+        self.assertNotIn("4111111111111111", masked)
+        self.assertIn("REDACTED-CARD", masked)
+
+    def test_rate_limiter_is_thread_safe(self):
+        limiter = dk.RateLimiter(max_attempts=100, window_seconds=60)
+        errors = []
+
+        def hammer():
+            try:
+                for _ in range(50):
+                    limiter.allow("shared-key")
+            except Exception as exc:  # pragma: no cover - failure path
+                errors.append(exc)
+
+        threads = [threading.Thread(target=hammer) for _ in range(10)]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join()
+
+        self.assertEqual(errors, [])
+        # Exactly 100 of the 500 total attempts should have been let through.
+        self.assertEqual(100 - limiter.remaining("shared-key"), 100)
+
+    def test_ip_blocklist_is_thread_safe(self):
+        blocklist = dk.IPBlocklist()
+        errors = []
+
+        def hammer(i):
+            try:
+                blocklist.block(f"10.0.0.{i % 255}", duration_seconds=5)
+                blocklist.is_blocked(f"10.0.0.{i % 255}")
+            except Exception as exc:  # pragma: no cover
+                errors.append(exc)
+
+        threads = [threading.Thread(target=hammer, args=(i,)) for i in range(20)]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join()
+        self.assertEqual(errors, [])
+
+    def test_replay_guard_detects_replay(self):
+        guard = dk.ReplayGuard(ttl_seconds=60)
+        self.assertFalse(guard.check("req-1"))
+        self.assertTrue(guard.check("req-1"))
+
+    def test_replay_guard_expires_after_ttl(self):
+        guard = dk.ReplayGuard(ttl_seconds=0.05)
+        self.assertFalse(guard.check("req-1"))
+        time.sleep(0.1)
+        self.assertFalse(guard.check("req-1"))  # expired, so treated as new
+
+    def test_replay_guard_rejects_invalid_ttl(self):
+        with self.assertRaises(dk.InvalidInputError):
+            dk.ReplayGuard(ttl_seconds=0)
+
+    def test_replay_guard_is_thread_safe(self):
+        guard = dk.ReplayGuard(ttl_seconds=60)
+        results = []
+
+        def hammer():
+            results.append(guard.check("shared-nonce"))
+
+        threads = [threading.Thread(target=hammer) for _ in range(20)]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join()
+        # Exactly one thread should have seen it as "new" (False).
+        self.assertEqual(results.count(False), 1)
+
+    def test_scan_directory_for_malware_signatures_docstring_mentions_limitation(self):
+        self.assertIn("exact-hash", dk.scan_directory_for_malware_signatures.__doc__.lower())
+
+    def test_check_password_strength_entropy_docstring_mentions_limitation(self):
+        self.assertIn("dictionary", dk.check_password_strength.__doc__.lower())
 
 
 if __name__ == "__main__":

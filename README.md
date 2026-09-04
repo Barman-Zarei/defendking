@@ -10,7 +10,7 @@ or access systems you don't own/manage.
 
 **Author:** Barman
 **License:** MIT
-**Current version:** 2.5.1
+**Current version:** 3.6.16
 
 ---
 
@@ -46,7 +46,20 @@ For local development (editable install from a clone):
 ```bash
 pip install -e ".[full,dev]"
 python -m pytest tests/ -v
+ruff check .
+mypy defendking/
 ```
+
+## CI/CD
+
+Every push to `main` runs:
+- **test** — the full test suite on Python 3.9-3.12
+- **lint** — `ruff` and `mypy`
+
+Pushing a version tag (e.g. `v3.6.16`) additionally triggers **publish**,
+which builds and uploads the package to PyPI via
+[Trusted Publishing](https://docs.pypi.org/trusted-publishers/) (OIDC) —
+no API token is stored anywhere. See `.github/workflows/ci.yml`.
 
 ## Quick start
 
@@ -493,6 +506,18 @@ seen = set()
 dk.detect_replay_attack("req-123", seen)   # False (new)
 dk.detect_replay_attack("req-123", seen)   # True (replay!)
 ```
+Not thread-safe and has no time-based expiry (only a size cap) - for
+those, use `ReplayGuard` below instead.
+
+### `ReplayGuard(ttl_seconds=300)`
+Thread-safe, TTL-based replay detector - each nonce is automatically
+forgotten after `ttl_seconds` instead of only being evicted once a size
+cap is hit.
+```python
+guard = dk.ReplayGuard(ttl_seconds=300)
+guard.check("req-123")   # False (new)
+guard.check("req-123")   # True (replay!)
+```
 
 ### `check_session_fixation(pre_login_session_id, post_login_session_id) -> dict`
 ```python
@@ -530,14 +555,55 @@ dk.check_api_rate_limit_headers({"X-RateLimit-Remaining": "0", "Retry-After": "3
   you pass real `previous_coords`/`new_coords` (haversine distance via
   `distance_km_between`). Without coordinates it falls back to a
   conservative fixed-distance estimate.
-- **`detect_replay_attack`'s in-memory `seen_nonces` set** doesn't expire
-  entries by time, only by count (`max_stored`) — for a real multi-process
-  service, back it with a TTL-based store (e.g. Redis).
+- **`entropy_bits` in `check_password_strength`** is a charset-size-based
+  estimate, not a dictionary-aware one (see the function's own docstring
+  for detail) - `score`/`label` combine it with pattern detection for a
+  more reliable overall verdict.
+- **`scan_directory_for_malware_signatures`** does exact-hash matching
+  only, which a single changed byte evades entirely - this is a property
+  of hash-based detection in general (see the function's docstring), not
+  something fixable within the function; pair it with a real AV/EDR
+  engine if you need resilience to modified variants.
+- **`detect_replay_attack`'s in-memory `seen_nonces` set** isn't
+  thread-safe and doesn't expire entries by time, only by count
+  (`max_stored`) - use `ReplayGuard` instead if either matters to you.
+- **`RateLimiter`/`IPBlocklist`/`ReplayGuard` are in-process only.** Their
+  internal locks make them safe to share across *threads*, but not across
+  separate *processes* or machines - back them with Redis (or similar)
+  for a multi-process/multi-instance deployment.
 - **`schedule_periodic_scan`** is a simple blocking loop for scripts/demos,
   not a production scheduler — use `APScheduler` or a system cron job for
   real deployments.
 
 ## Changelog
+
+### 3.6.16
+- **Fixed every weakness identified in a self-review of 2.5.1:**
+  - **ReDoS mitigation:** all regex-heavy scanning functions now cap
+    input length (`_MAX_SCANNED_TEXT_LENGTH` / `_MAX_LONG_TEXT_LENGTH`)
+    before running pattern matching, bounding worst-case regex cost
+    regardless of which specific pattern might be added later.
+  - **Thread-safety:** `RateLimiter` and `IPBlocklist` now use an
+    internal lock and are safe to share across threads. Added
+    `ReplayGuard`, a thread-safe, TTL-based replacement for
+    `detect_replay_attack`'s plain-set approach.
+  - **Fewer false positives:** `mask_sensitive_data_in_logs` now
+    Luhn-validates digit runs before redacting them as "card numbers,"
+    instead of flagging any 13-19-digit sequence (phone numbers, order
+    IDs, timestamps included).
+  - **Network retry/backoff:** `check_ssl_certificate` and
+    `check_tls_version_support` now retry transient connection failures
+    with a short backoff instead of reporting a single dropped packet as
+    a hard failure.
+  - **Honest documentation for two inherent limitations** that aren't
+    fixable within the function itself: `entropy_bits`' charset-based
+    (not dictionary-aware) estimate, and exact-hash malware matching's
+    single-byte-change blind spot.
+- **Added CI/CD** (`.github/workflows/ci.yml`): test matrix (Python
+  3.9-3.12), `ruff` + `mypy` lint job, and an automated PyPI publish job
+  (via Trusted Publishing/OIDC) triggered by pushing a version tag.
+- No new user-facing functions were added in this release - the focus was
+  entirely on hardening the ~70 functions that already existed.
 
 ### 2.5.1
 - Added `defendking.exceptions` (`DefendKingError`, `InvalidInputError`,
