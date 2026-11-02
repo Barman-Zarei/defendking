@@ -2,8 +2,7 @@
 DefendKing - Defensive Security Toolkit
 =========================================
 
-This package keeps all logic in a single module (`handler.py`) for
-simplicity, and re-exports everything here so consumers can just do:
+This package re-exports its checks and reporting helpers here so consumers can just do:
 
     import defendking
     defendking.check_password_strength("...")
@@ -102,6 +101,7 @@ from .handler import (
     verify_csp_header,
     verify_password,
 )
+from .reporting import SecurityCheckResult
 
 __all__ = [
     "check_password_strength", "check_password_breached", "generate_strong_password",
@@ -124,7 +124,7 @@ __all__ = [
     "generate_secure_token", "ApiKeyRecord", "rotate_api_key", "mask_sensitive_data_in_logs",
     "encrypt_sensitive_data", "decrypt_sensitive_data", "validate_jwt_token",
     "check_secrets_in_codebase",
-    "SecurityFinding", "calculate_risk_score", "generate_security_report",
+    "SecurityFinding", "SecurityCheckResult", "calculate_risk_score", "generate_security_report",
     "export_findings_to_json", "generate_incident_response_report", "audit_user_permissions",
     "notify_admin_dashboard", "send_security_alert", "schedule_periodic_scan",
     "generate_security_checklist",

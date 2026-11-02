@@ -461,14 +461,55 @@ dk.calculate_risk_score(findings)
 # {'score': 14, 'level': 'low', 'finding_count': 1, 'by_severity': {'high': 1}, 'has_critical_finding': False}
 ```
 
-### `generate_security_report(findings, target_name="system") -> str`
-Markdown report.
+### `generate_security_report(findings, target_name="system", *, checks=None) -> str`
+Markdown report. Supply explicit check outcomes to distinguish completed,
+failed and skipped checks from security findings.
 
-### `export_findings_to_json(findings, output_path) -> dict`
+### `export_findings_to_json(findings, output_path, *, checks=None) -> dict`
 ```python
 dk.export_findings_to_json(findings, "report.json")
 # {'success': True, 'path': 'report.json'}
 ```
+
+### `SecurityCheckResult(check_id, status, reason=None)`
+
+Each declared check contributes to coverage. A check can complete and still
+produce findings. Failed or skipped checks, or an empty check list, make
+coverage `incomplete` and overall risk `undetermined` with a null score.
+The risk of recorded findings remains visible separately, even when coverage
+is incomplete. `complete` describes only the checks the caller declared; it
+does not establish that all relevant checks were included or that a target is safe.
+
+```python
+checks = [dk.SecurityCheckResult.from_result("password", dk.check_password_strength("example"))]
+try:
+    dk.compute_file_hash("missing.txt")
+except dk.ExternalServiceError as error:
+    checks.append(dk.SecurityCheckResult.from_exception("file", error))
+else:
+    checks.append(dk.SecurityCheckResult("file", "completed"))
+
+report = dk.generate_security_report([], "example", checks=checks)
+# If the file is missing:
+# Overall risk: undetermined (incomplete check coverage)
+# Coverage: incomplete (1/2 completed; 1 failed; 0 skipped)
+dk.export_findings_to_json([], "report.json", checks=checks)
+```
+
+With `checks`, JSON contains `findings`, `coverage`, `checks`, `risk`, and
+`recorded_findings_risk`. Markdown and JSON use the same coverage counts.
+Without `checks`, existing report behavior and the JSON findings array are
+preserved; this legacy form contains no coverage assessment.
+
+Use short public IDs such as `tls` or `file`, never paths, hostnames, tokens
+or exception messages. Allowed statuses are `completed` (no reason), `failed`
+(`missing-file`, `network-error`, `external-service-error`), and `skipped`
+(`disabled`, `not-run`). `from_exception` accepts operational exceptions and
+their chained causes; programmer errors remain errors. `from_result` accepts
+a check dictionary and marks explicit `success=False` or an error field as a
+failure. Negative security results such as `valid=False` alone still mean a
+completed check. These adapters retain no raw error text. Existing findings
+and caller-provided report names remain caller-controlled content.
 
 ### `generate_incident_response_report(incident_title, detected_at, affected_systems, actions_taken) -> str`
 

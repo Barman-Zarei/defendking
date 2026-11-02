@@ -83,6 +83,7 @@ from datetime import datetime, timezone
 from typing import Any, Optional
 
 from .exceptions import ExternalServiceError, InvalidInputError
+from .reporting import SecurityCheckResult, coverage_summary
 
 # --------------------------------------------------------------------------
 # Module-level logger. Consumers of the package can configure handlers;
@@ -2092,21 +2093,38 @@ def calculate_risk_score(findings: list[SecurityFinding]) -> dict[str, Any]:
     }
 
 
-def generate_security_report(findings: list[SecurityFinding], target_name: str = "system") -> str:
+def generate_security_report(
+    findings: list[SecurityFinding], target_name: str = "system", *,
+    checks: Optional[list[SecurityCheckResult]] = None,
+) -> str:
     """
     Produce a human-readable Markdown security report from a list of
-    findings. Raises `InvalidInputError` if `findings` isn't a list.
+    findings. With explicit `checks`, incomplete coverage makes overall risk
+    undetermined while preserving the risk of recorded findings separately.
+    Omitting `checks` preserves the legacy findings-only report.
     """
     _require_type(findings, list, "findings")
     risk = calculate_risk_score(findings)
+    coverage = coverage_summary(checks) if checks is not None else None
     lines = [
         f"# Security Report - {target_name}",
         f"Date: {datetime.now(timezone.utc).isoformat()}",
-        f"Overall risk score: {risk['score']} / 100 ({risk['level']})",
+        ("Overall risk: undetermined (incomplete check coverage)" if coverage and coverage["status"] != "complete"
+         else f"Overall risk score: {risk['score']} / 100 ({risk['level']})"),
         f"Findings by severity: {risk.get('by_severity', {})}",
-        "",
-        "## Findings",
     ]
+    if coverage is not None:
+        lines.extend([
+            f"Coverage: {coverage['status']} ({coverage['completed']}/{coverage['total']} completed; "
+            f"{coverage['failed']} failed; {coverage['skipped']} skipped)",
+            f"Recorded findings risk score: {risk['score']} / 100 ({risk['level']})",
+            "",
+            "## Check outcomes",
+        ])
+        for check in checks or []:
+            reason = f" ({check.reason})" if check.reason else ""
+            lines.append(f"- {check.check_id}: {check.status}{reason}")
+    lines.extend(["", "## Findings"])
     if not findings:
         lines.append("No findings recorded.")
     for f in sorted(findings, key=lambda x: _SEVERITY_WEIGHTS.get(x.severity, 0), reverse=True):
@@ -2114,7 +2132,9 @@ def generate_security_report(findings: list[SecurityFinding], target_name: str =
     return "\n".join(lines)
 
 
-def export_findings_to_json(findings: list[SecurityFinding], output_path: str) -> dict[str, Any]:
+def export_findings_to_json(
+    findings: list[SecurityFinding], output_path: str, *, checks: Optional[list[SecurityCheckResult]] = None,
+) -> dict[str, Any]:
     """
     Serialize findings to a JSON file for machine consumption / dashboards.
     Returns `{"success": True, "path": ...}` on success.
@@ -2122,6 +2142,9 @@ def export_findings_to_json(findings: list[SecurityFinding], output_path: str) -
     If the file can't be written (permissions, missing directory), returns
     `{"success": False, "error": ..., "error_type": "ExternalServiceError"}`
     instead of raising.
+    With `checks`, writes an object containing findings, coverage, sanitized
+    check outcomes, overall risk and recorded-findings risk. Without `checks`,
+    preserves the legacy JSON array.
     """
     _require_type(findings, list, "findings")
     data = [
@@ -2133,9 +2156,20 @@ def export_findings_to_json(findings: list[SecurityFinding], output_path: str) -
         }
         for f in findings
     ]
+    document: Any = data
+    if checks is not None:
+        coverage = coverage_summary(checks)
+        recorded_risk = calculate_risk_score(findings)
+        document = {
+            "findings": data,
+            "coverage": coverage,
+            "checks": [check.to_dict() for check in checks],
+            "risk": recorded_risk if coverage["status"] == "complete" else {"score": None, "level": "undetermined"},
+            "recorded_findings_risk": recorded_risk,
+        }
     try:
         with open(output_path, "w", encoding="utf-8") as fp:
-            json.dump(data, fp, ensure_ascii=False, indent=2)
+            json.dump(document, fp, ensure_ascii=False, indent=2)
         return {"success": True, "path": output_path}
     except OSError as exc:
         wrapped = ExternalServiceError(f"could not write to '{output_path}': {exc}")
